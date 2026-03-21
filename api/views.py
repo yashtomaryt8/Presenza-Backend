@@ -47,12 +47,10 @@ class RegisterUser(APIView):
         if not images:
             return Response({'error': 'At least one image is required.'}, status=400)
 
-        # Find or create user (by student_id if provided)
         existing_user = None
         if student_id:
             existing_user = UserProfile.objects.filter(student_id=student_id).first()
 
-        # Extract embeddings from all uploaded images
         new_embeddings = []
         hf_errors = []
         for img in images:
@@ -68,8 +66,6 @@ class RegisterUser(APIView):
                 'error': f'No faces detected in any photo. Detail: {error_detail}'
             }, status=400)
 
-        # ── Duplicate face check ──────────────────────────────────
-        # Check each new embedding against all EXISTING users (skip current user if updating)
         exclude_id = existing_user.id if existing_user else None
         for emb in new_embeddings:
             dup_user, dup_score = check_duplicate_face(emb, exclude_user_id=exclude_id)
@@ -78,14 +74,12 @@ class RegisterUser(APIView):
                     'error': (
                         f"This face is already registered as '{dup_user.name}' "
                         f"({dup_score * 100:.0f}% match). "
-                        f"If this is a different person, please use clearer photos "
-                        f"showing distinct features, or contact an admin."
+                        f"If this is a different person, use clearer, well-lit photos."
                     ),
                     'duplicate_user': dup_user.name,
                     'similarity': round(dup_score, 3),
-                }, status=409)  # 409 Conflict
+                }, status=409)
 
-        # Save user
         if existing_user is None:
             existing_user = UserProfile(name=name, student_id=student_id, department=department)
 
@@ -104,11 +98,6 @@ class RegisterUser(APIView):
 
 
 class ExtractMultiFaces(APIView):
-    """
-    POST /api/extract-multi/
-    Sends image to HF Space, returns all detected faces with bboxes.
-    Frontend uses this to let user select which face is theirs.
-    """
     def post(self, request):
         f = request.FILES.get('image')
         if not f:
@@ -133,7 +122,7 @@ class ExtractMultiFaces(APIView):
         except Exception as e:
             return Response({'error': str(e)}, status=500)
 
-# ── Add Photos ────────────────────────────────────────────────────
+
 class AddPhotos(APIView):
     def post(self, request, pk):
         try:
@@ -144,7 +133,7 @@ class AddPhotos(APIView):
         for key, f in request.FILES.items():
             if key.startswith('image'):
                 img = _decode_image(f)
-                if img:
+                if img is not None:
                     emb, _ = get_embedding(img)
                     if emb is not None:
                         user.add_embedding(emb)
@@ -320,19 +309,11 @@ class SemanticQueryView(APIView):
         prompt = f"{context}\n\nQuestion: {query}\n\nAnswer specifically using the data above:"
 
         if mode == 'ollama':
-            answer = query_ollama(
-                prompt,
-                host=getattr(settings, 'OLLAMA_HOST', 'http://localhost:11434'),
-                model=getattr(settings, 'OLLAMA_MODEL', 'llama3.2:1b'),
-                system=_SEMANTIC_SYSTEM,
-            )
+            answer = query_ollama(prompt, host=getattr(settings, 'OLLAMA_HOST', 'http://localhost:11434'),
+                                  model=getattr(settings, 'OLLAMA_MODEL', 'llama3.2:1b'), system=_SEMANTIC_SYSTEM)
         else:
-            answer = query_groq(
-                prompt,
-                api_key=getattr(settings, 'GROQ_API_KEY', ''),
-                model=getattr(settings, 'GROQ_MODEL', 'llama-3.1-8b-instant'),
-                system=_SEMANTIC_SYSTEM,
-            )
+            answer = query_groq(prompt, api_key=getattr(settings, 'GROQ_API_KEY', ''),
+                                model=getattr(settings, 'GROQ_MODEL', 'llama-3.1-8b-instant'), system=_SEMANTIC_SYSTEM)
 
         return Response({'answer': answer, 'data': records})
 
@@ -353,8 +334,7 @@ class AIInsightView(APIView):
             'present_today':         present,
             'attendance_rate_today': round(present / total * 100, 1) if total else 0,
             'late_today':            AttendanceLog.objects.filter(
-                                         timestamp__date=today,
-                                         event_type='entry',
+                                         timestamp__date=today, event_type='entry',
                                          timestamp__hour__gte=9
                                      ).values('user').distinct().count(),
             'week_total':            AttendanceLog.objects.filter(
@@ -370,17 +350,11 @@ class AIInsightView(APIView):
 
         prompt = custom if custom else build_analytics_prompt(stats)
         if mode == 'ollama':
-            result = query_ollama(
-                prompt,
-                host=getattr(settings, 'OLLAMA_HOST', 'http://localhost:11434'),
-                model=getattr(settings, 'OLLAMA_MODEL', 'llama3.2:1b'),
-            )
+            result = query_ollama(prompt, host=getattr(settings, 'OLLAMA_HOST', 'http://localhost:11434'),
+                                  model=getattr(settings, 'OLLAMA_MODEL', 'llama3.2:1b'))
         else:
-            result = query_groq(
-                prompt,
-                api_key=getattr(settings, 'GROQ_API_KEY', ''),
-                model=getattr(settings, 'GROQ_MODEL', 'llama-3.1-8b-instant'),
-            )
+            result = query_groq(prompt, api_key=getattr(settings, 'GROQ_API_KEY', ''),
+                                model=getattr(settings, 'GROQ_MODEL', 'llama-3.1-8b-instant'))
         return Response({'insight': result, 'mode': mode})
 
 
@@ -422,10 +396,19 @@ class ResetPresence(APIView):
 
 class HealthCheck(APIView):
     def get(self, request):
+        """
+        Enhanced health check — returns live stats for the sidebar.
+        Called every 30s by the frontend. Keep it fast (indexed queries only).
+        """
+        today = timezone.now().date()
         return Response({
-            'status':   'ok',
-            'users':    UserProfile.objects.count(),
-            'hf_space': getattr(settings, 'HF_SPACE_URL', 'not set'),
+            'status':        'ok',
+            'users':         UserProfile.objects.count(),
+            'present_now':   UserProfile.objects.filter(is_present=True).count(),
+            'present_today': AttendanceLog.objects.filter(
+                                 timestamp__date=today, event_type='entry'
+                             ).values('user').distinct().count(),
+            'hf_space':      getattr(settings, 'HF_SPACE_URL', 'not set'),
         })
 
 
