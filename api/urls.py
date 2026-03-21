@@ -5,7 +5,7 @@ from .views import (
     AttendanceLogView, AttendanceSessionView,
     AnalyticsView, ExportCSV,
     AIInsightView, SemanticQueryView,
-    ResetPresence, HealthCheck,
+    ResetPresence, HealthCheck, ExtractMultiFaces
 )
 
 urlpatterns = [
@@ -22,4 +22,5 @@ urlpatterns = [
     path('ai-insight/',               AIInsightView.as_view()),
     path('semantic-query/',           SemanticQueryView.as_view()),
     path('reset-presence/',           ResetPresence.as_view()),
+    path('extract-multi/',            ExtractMultiFaces.as_view()),
 ]
