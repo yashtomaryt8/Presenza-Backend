@@ -6,7 +6,6 @@ gunicorn>=21.2
 opencv-python-headless>=4.8
 numpy>=1.24
 requests>=2.31
-dj-database-url>=2.1       
-psycopg2-binary>=2.9       
-torch==2.1.0+cpu               
+dj-database-url>=2.1
+psycopg2-binary>=2.9
 groq>=0.4
