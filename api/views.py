@@ -12,7 +12,8 @@ from rest_framework.response import Response
 
 from .models import UserProfile, AttendanceLog, AttendanceSession
 from .serializers import UserSerializer, AttendanceLogSerializer, AttendanceSessionSerializer
-from .face_utils import get_embedding, process_frame, check_duplicate_face, invalidate_cache
+from .face_utils import (get_embedding, process_frame, check_duplicate_face,
+                          invalidate_cache, _get_cache, mark_attendance, sim_to_display_pct)
 from .ai_utils import (query_groq, query_ollama, build_analytics_prompt,
                         build_semantic_context, _SEMANTIC_SYSTEM)
 
@@ -145,7 +146,7 @@ class AddPhotos(APIView):
         return Response({'message': f'Added {added} photo(s).', 'photo_count': user.photo_count})
 
 
-# ── Scan ──────────────────────────────────────────────────────────
+# ── Scan (kept for backwards compat — not used by Scanner.jsx in v4) ──────────
 class ScanFrame(APIView):
     def post(self, request):
         img = None
@@ -178,6 +179,80 @@ class ScanFrame(APIView):
             'detections':  detections,
             'face_count':  len(detections),
             'known_count': sum(1 for d in detections if d['name'] not in ('Unknown', 'SPOOF')),
+        })
+
+
+# ── User embeddings — new endpoint for client-side matching ───────────────────
+class UserEmbeddingsView(APIView):
+    """
+    GET /api/users/embeddings/
+
+    Returns the pre-computed L2-normalised centroid embedding for every
+    registered user. The Scanner frontend downloads this once on mount and
+    uses pure JS cosine similarity to match live face embeddings locally,
+    bypassing Railway on the hot scan path entirely (~300–400ms saved per scan).
+
+    Payload: ~1.5 KB per user (512 float32s × 4 bytes).
+    20 users ≈ 30 KB — tiny, loads in <50ms on any connection.
+
+    The centroid is the mean of all registration photos' embeddings,
+    then L2-normalised (|centroid| = 1).  This means matching is just
+    a single dot product on the client: sim = dot(emb, centroid) / |emb|.
+    """
+    def get(self, request):
+        users, emb_cache = _get_cache()
+        result = []
+        for user in users:
+            centroid = emb_cache.get(user.id)
+            if centroid is None:
+                continue
+            result.append({
+                'id':         user.id,
+                'name':       user.name,
+                'student_id': user.student_id,
+                'department': user.department,
+                # centroid is already L2-normalised np.ndarray — send as list
+                'centroid':   centroid.tolist(),
+            })
+        return Response({'users': result, 'count': len(result)})
+
+
+# ── Attendance log — lightweight endpoint for fire-and-forget logging ─────────
+class LogAttendanceView(APIView):
+    """
+    POST /api/log/
+    Body: {user_id, event_type, raw_sim}
+
+    Called by the frontend after client-side matching confirms a face.
+    This endpoint is fire-and-forget — the frontend does NOT await it.
+    It enforces server-side cooldown as a safety net against race conditions.
+    """
+    def post(self, request):
+        user_id    = request.data.get('user_id')
+        event_type = request.data.get('event_type', 'entry')
+        raw_sim    = float(request.data.get('raw_sim', 0.35))
+
+        if event_type not in ('entry', 'exit'):
+            return Response({'error': 'Invalid event_type'}, status=400)
+
+        if not user_id:
+            return Response({'error': 'user_id required'}, status=400)
+
+        try:
+            user = UserProfile.objects.get(pk=user_id)
+        except UserProfile.DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+
+        logged, reason = mark_attendance(user, event_type, raw_sim)
+
+        return Response({
+            'logged':     logged,
+            'reason':     reason,
+            'name':       user.name,
+            'student_id': user.student_id,
+            'department': user.department,
+            'confidence': sim_to_display_pct(raw_sim),
+            'event_type': event_type,
         })
 
 
@@ -333,14 +408,14 @@ class AIInsightView(APIView):
             'total_users':           total,
             'present_today':         present,
             'attendance_rate_today': round(present / total * 100, 1) if total else 0,
-            'late_today':            AttendanceLog.objects.filter(
-                                         timestamp__date=today, event_type='entry',
-                                         timestamp__hour__gte=9
-                                     ).values('user').distinct().count(),
-            'week_total':            AttendanceLog.objects.filter(
-                                         timestamp__date__gte=today - timedelta(days=6),
-                                         event_type='entry'
-                                     ).count(),
+            'late_today': AttendanceLog.objects.filter(
+                              timestamp__date=today, event_type='entry',
+                              timestamp__hour__gte=9
+                          ).values('user').distinct().count(),
+            'week_total': AttendanceLog.objects.filter(
+                              timestamp__date__gte=today - timedelta(days=6),
+                              event_type='entry'
+                          ).count(),
             'week_avg': 0, 'top_attendee': 'N/A', 'peak_hour': 'unknown',
         }
         top = (AttendanceLog.objects.filter(event_type='entry')
@@ -396,10 +471,6 @@ class ResetPresence(APIView):
 
 class HealthCheck(APIView):
     def get(self, request):
-        """
-        Enhanced health check — returns live stats for the sidebar.
-        Called every 30s by the frontend. Keep it fast (indexed queries only).
-        """
         today = timezone.now().date()
         return Response({
             'status':        'ok',
@@ -408,7 +479,7 @@ class HealthCheck(APIView):
             'present_today': AttendanceLog.objects.filter(
                                  timestamp__date=today, event_type='entry'
                              ).values('user').distinct().count(),
-            'hf_space':      getattr(settings, 'HF_SPACE_URL', 'not set'),
+            'hf_space':      getattr(settings, 'HF_SPACE_URL', ''),
         })
 
 
